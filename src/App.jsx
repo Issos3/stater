@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts'
+import { auth, signInWithGoogle, logOut, onAuthStateChanged, saveUserData, getUserData, subscribeToUserData } from './firebase'
 
 // ============================================================================
 // CONFIGURATION & INITIAL DATA
@@ -873,6 +874,8 @@ const ImportExportModal = ({ isOpen, onClose, config, onImport, onReset }) => {
 // ============================================================================
 
 export default function App() {
+  const [user, setUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
   const [config, setConfig] = useState(() => loadFromStorage(STORAGE_KEYS.CONFIG, INITIAL_CONFIG))
   const [prices, setPrices] = useState(() => loadFromStorage(STORAGE_KEYS.PRICES, {}))
   const [eurRate, setEurRate] = useState(0.92)
@@ -886,6 +889,65 @@ export default function App() {
   const [hideAmounts, setHideAmounts] = useState(() => loadFromStorage('stater_hide_amounts', false))
   const [priceChanges, setPriceChanges] = useState({})
   const [stockPrices, setStockPrices] = useState({})
+  const [syncStatus, setSyncStatus] = useState(null) // 'syncing', 'synced', 'error'
+  const lastSyncRef = useRef(null)
+  const unsubscribeRef = useRef(null)
+
+  // Auth state listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      setUser(firebaseUser)
+      setAuthLoading(false)
+
+      if (firebaseUser) {
+        // Load data from Firestore
+        setSyncStatus('syncing')
+        const userData = await getUserData(firebaseUser.uid)
+        if (userData) {
+          if (userData.config) setConfig(userData.config)
+          if (userData.history) setHistory(userData.history)
+        }
+        setSyncStatus('synced')
+
+        // Subscribe to realtime updates
+        if (unsubscribeRef.current) unsubscribeRef.current()
+        unsubscribeRef.current = subscribeToUserData(firebaseUser.uid, (data) => {
+          // Only update if data is newer than our last save
+          if (data.updatedAt && data.updatedAt !== lastSyncRef.current) {
+            if (data.config) setConfig(data.config)
+            if (data.history) setHistory(data.history)
+            lastSyncRef.current = data.updatedAt
+          }
+        })
+      } else {
+        // User logged out, unsubscribe
+        if (unsubscribeRef.current) {
+          unsubscribeRef.current()
+          unsubscribeRef.current = null
+        }
+      }
+    })
+
+    return () => {
+      unsubscribe()
+      if (unsubscribeRef.current) unsubscribeRef.current()
+    }
+  }, [])
+
+  // Save to Firebase when config or history changes (debounced)
+  useEffect(() => {
+    if (!user) return
+
+    const timeoutId = setTimeout(async () => {
+      setSyncStatus('syncing')
+      const timestamp = new Date().toISOString()
+      lastSyncRef.current = timestamp
+      await saveUserData(user.uid, { config, history })
+      setSyncStatus('synced')
+    }, 1000) // Debounce 1 second
+
+    return () => clearTimeout(timeoutId)
+  }, [config, history, user])
 
   // Get all crypto IDs for price fetching
   const cryptoIds = useMemo(() => {
@@ -1245,13 +1307,68 @@ export default function App() {
     })
   }
 
+  // Handle login
+  const handleLogin = async () => {
+    try {
+      await signInWithGoogle()
+    } catch (e) {
+      console.error('Login failed:', e)
+    }
+  }
+
+  // Handle logout
+  const handleLogout = async () => {
+    try {
+      await logOut()
+    } catch (e) {
+      console.error('Logout failed:', e)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-black pb-safe">
       {/* Header */}
       <header className="sticky top-0 z-40 bg-black/95 backdrop-blur border-b border-zinc-800 px-4 py-3">
         <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold">Stater</h1>
+          <div className="flex items-center gap-2">
+            <h1 className="text-xl font-bold">Stater</h1>
+            {syncStatus === 'syncing' && (
+              <svg className="w-4 h-4 text-gray-500 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+            )}
+            {syncStatus === 'synced' && user && (
+              <svg className="w-4 h-4 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+            )}
+          </div>
           <div className="flex items-center gap-1">
+            {/* Auth button */}
+            {authLoading ? null : user ? (
+              <button
+                onClick={handleLogout}
+                className="flex items-center gap-2 text-gray-400 hover:text-white p-2"
+                title={`Connecte: ${user.email}`}
+              >
+                <img
+                  src={user.photoURL}
+                  alt=""
+                  className="w-6 h-6 rounded-full"
+                />
+              </button>
+            ) : (
+              <button
+                onClick={handleLogin}
+                className="text-gray-400 hover:text-white p-2"
+                title="Se connecter avec Google"
+              >
+                <svg className="w-5 h-5" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12.545,10.239v3.821h5.445c-0.712,2.315-2.647,3.972-5.445,3.972c-3.332,0-6.033-2.701-6.033-6.032s2.701-6.032,6.033-6.032c1.498,0,2.866,0.549,3.921,1.453l2.814-2.814C17.503,2.988,15.139,2,12.545,2C7.021,2,2.543,6.477,2.543,12s4.478,10,10.002,10c8.396,0,10.249-7.85,9.426-11.748L12.545,10.239z"/>
+                </svg>
+              </button>
+            )}
             <button
               onClick={() => {
                 setHideAmounts(!hideAmounts)
